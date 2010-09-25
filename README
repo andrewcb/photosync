@@ -1,0 +1,12 @@
+A rsync-like program tailored to synchronising photos from a camera/memory card
+with a directory. This has the following differences from rsync:
+
+ 1. It understands the numerical, sequential nature of camera DPOF filesystems,
+    and finds the highest number in the repository and doesn't copy anything 
+    below that (good for when the repository is a temporary holding directory,
+    whose contents are moved elsewhere), and
+
+ 2. It can automatically case-fold filenames to upper- or lower-case.
+
+To use: just make sure there is a Python interpreter in the path (callable 
+as 'python') and run the 'photosync' script.

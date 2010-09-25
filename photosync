@@ -1,0 +1,208 @@
+#!/usr/bin/env python
+"""
+photosync - a utility for synchronising photos from a camera or memory card 
+with a DCIM filesystem to a directory on the local filesystem somewhat more 
+intelligently (given the specific task at hand) than rsync.
+
+Other than not supporting any sort of network copying as such or most of 
+rsync's options, photosync differs from rsync in two aspects:
+
+ 1) photosync assumes that both source and destination are digital camera 
+    image (DCIM) directories, ignoring non-DCIM files, scanning both to 
+    find the highest directory and file numbers on each, and only copies 
+    files from the source higher than the highest on the destination. 
+    This ensures, for example, that should one keep old files on a memory 
+    card but delete most of them from a holding directory one is copying to, 
+    photosync will not copy absent files older than the newest one on the 
+    holding directory (oldness being determined solely by number), and
+
+ 2) photosync pays attention to the case of filenames in source and 
+    destination directories and, if the destination's names are solely 
+    upper- or lower-case, will case-fold copied files to match. This can
+    be overridden with the -c and -C flags.  This is useful when a FAT 
+    filesystem may be mounted by one or more operating systems, with different
+    case-handling behaviours.
+"""
+
+# the repository directory has the structure of a DCIM filesystem, with 
+# subdirectories of the form '\d{3}[^\d]+' containing files of the form 
+# '^[^\d]*[\d]+\..*'.
+
+import os
+import os.path
+import shutil
+import re
+
+class DCIMDir(object):
+    """A class representing a DCIM-style directory"""
+
+    re_subdir = re.compile("(\d{3})([^0-9]+)")
+    re_file = re.compile("([A-Za-z0-9_]{4})(\d+)\.([^.]*)")
+
+    def __init__(self, path):
+        self.path = path
+        # directory number -> directory name
+        self.dirmap = {}
+        # directory number -> { file number -> [filenames] }
+        self.dirfilemap = {}
+        # have we seen upper/lower-case characters yet
+        self.has_uppercase = False
+        self.has_lowercase = False
+        # has a scan been done?
+        self.scanned = False
+
+
+    def _scan(self):
+        subdirs = os.listdir(self.path)
+        self.dirmap = dict([(int(m.group(1)), m.group(0)) for m in 
+            [ self.re_subdir.match(d) for d in subdirs ]
+            if m ])
+        for dirnum in self.dirmap.keys():
+            dirp = os.path.join(self.path, self.dirmap[dirnum])
+            files = os.listdir(dirp)
+            # only add a directory to dirfilemap once it's non-empty
+            dirfiles = {}
+            #self.dirfilemap[dirnum] = {}
+            for f in files:
+                m = self.re_file.match(f)
+                if m:
+                    filenum = int(m.group(2))
+                    #self.dirfilemap[dirnum].setdefault(filenum,[]).append(f)
+                    dirfiles.setdefault(filenum,[]).append(f)
+                    if f != f.lower():   
+                        self.has_uppercase = True
+                    if f != f.upper():   
+                        self.has_lowercase = True
+            if dirfiles:
+                self.dirfilemap[dirnum] = dirfiles
+            
+            
+        for dn in self.dirmap.values():  # only the ones we care about
+            if dn != dn.lower():   
+                self.has_uppercase = True
+            if dn != dn.upper():   
+                self.has_lowercase = True
+        self.scanned = True
+
+    def getHighestNumber(self):
+        if not self.scanned:
+            self._scan()
+        # return the highest dir number that's non-empty
+        if not self.dirfilemap:  return None
+        maxdir = max(self.dirfilemap.keys())
+        return (maxdir, max(self.dirfilemap[maxdir].keys()))
+
+    def getdirpath(self, v, absolute=False):
+        """Given a directory number, return a filesystem path
+           to the directory."""
+        try:
+            p = self.dirmap[v]
+        except KeyError:
+            return None
+        if absolute:
+            return os.path.join(self.path,p)
+        else:
+            return p
+
+    def getfilepaths(self, v, f, absolute=False):
+        """Given a volume and optionally a file, return a filesystem path
+           to the volume or file."""
+        if absolute:
+            fn = lambda fname:os.path.join(self.path, self.dirmap[v], fname)
+        else:
+            fn = lambda fname:os.path.join(self.dirmap[v], fname)
+        try:
+            return [fn(f) for f in self.dirfilemap[v][f]]
+        except KeyError:
+            return None
+        
+
+import sys
+from optparse import OptionParser
+
+parser = OptionParser(usage="usage: %prog [options] src dest")
+parser.add_option('-v', '--verbose', action="count", dest="verbose", default=0)
+parser.add_option('-d', '--dummy', action="store_true", dest="dummy", default=False, help="Don't actually copy files")
+parser.add_option('-c', '--lowercase', action="store_true", dest="force_lowercase", default=False, help="Forcibly case-fold filenames to lowercase on copy")
+parser.add_option('-C', '--uppercase', action="store_true", dest="force_uppercase", default=False, help="Forcibly case-fold filenames to uppercase on copy")
+
+(options, args) = parser.parse_args()
+
+#print options, args
+
+if len(args) != 2: 
+    parser.print_help()
+    sys.exit(1)
+
+src,dest = args
+
+ds = DCIMDir(src)
+dd = DCIMDir(dest)
+
+ds._scan()
+if not bool(ds.dirmap):
+    sys.exit("""No digital camera data found in '%s'. 
+Are you sure this is a digital camera directory? (It should contain 
+directories with names beginning with three digits; on a memory card or 
+camera, it will typically be named 'DCIM' or 'dcim'."""%src)
+
+# determine the case-folding behaviour
+
+if not dd.has_uppercase or options.force_lowercase:
+    dest_fn_xform = lambda s:s.lower()
+elif not dd.has_lowercase or options.force_uppercase:
+    dest_fn_xform = lambda s:s.upper()
+else:
+    dest_fn_xform = lambda s:s
+
+
+src_max_dir, src_max_file = ds.getHighestNumber()
+dest_max_dir, dest_max_file = dd.getHighestNumber()
+if options.verbose >= 2: 
+    print "Highest dir/file in source is %d/%d"%(src_max_dir,src_max_file)
+    print "Highest dir/file in destination is %d/%d"%(dest_max_dir,dest_max_file)
+
+def do_copy_files(dir, startfile=None, endfile=None):
+    """Do the actual copying, or not if in dummy mode."""
+    if not startfile:
+        startfile = min(ds.dirfilemap[dir].keys())
+    if not endfile:
+        endfile = max(ds.dirfilemap[dir].keys())
+    #print "Will copy files (%d, [%d..%d])"%(dir,startfile,endfile)
+
+    dirpath = os.path.join(dd.path, dest_fn_xform(ds.getdirpath(dir)))
+
+    if not os.path.isdir(dirpath):
+        os.mkdir(dirpath)
+    
+    for fileno in range(startfile, endfile+1):
+        files = ds.dirfilemap[dir].get(fileno, [])
+        #files = ds.getfilepaths(dir, fileno)
+
+	for file in (files or []):
+            #print "Will copy ", file
+	    spath = os.path.join(ds.path, ds.getdirpath(dir), file)
+	    dpath = os.path.join(dirpath, dest_fn_xform(file))
+	    #print 'cp %s %s'%(spath,dpath)
+	    if not os.path.exists(dpath) or (os.path.getsize(dpath) == 0):
+		if options.verbose>=1:
+		    print file
+                if not options.dummy:
+	            shutil.copyfile(spath,dpath)
+
+# now do the copying
+if src_max_dir < dest_max_dir or (src_max_dir == dest_max_dir and src_max_file <= dest_max_file):
+    # Case 1: we're up to date
+    pass
+elif src_max_dir == dest_max_dir and src_max_file>dest_max_file:
+    # Case 2: copy files dest_max_file+1 to src_max_file to dest
+    do_copy_files(dir=src_max_dir, startfile=dest_max_file+1, endfile=src_max_file)
+else:
+    # Case 3: src_max_dir > dest_max_dir
+    assert(src_max_dir>dest_max_dir)
+    # 1: copy the remaining files to dest_max_dir
+    do_copy_files(dir=dest_max_dir, startfile=dest_max_file+1)
+    # 2: copy the new directories
+    for dir in range(dest_max_dir+1, src_max_dir+1):
+        do_copy_files(dir=dir)
+
